@@ -1,0 +1,15 @@
+{
+  "r2": {
+    "account_id": "填写 Cloudflare Account ID",
+    "access_key_id": "填写 R2 API Token Access Key ID",
+    "secret_access_key": "填写 R2 API Token Secret Access Key",
+    "bucket": "amazon-product-img",
+    "public_base_url": "https://img.shuige.win",
+    "region": "auto"
+  },
+  "image_url_regex": "^https://example\\.com/",
+  "cache_file": "data/image_cache.json",
+  "log_file": "logs/amazon_img.log",
+  "request_timeout_seconds": 30,
+  "user_agent": "AmazonImageUploader/1.0"
+}

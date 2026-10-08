@@ -1,0 +1,7 @@
+config.json
+data/
+logs/
+*.amazon-img-*.xlsx
+*.amazon-img-*.xlsm
+__pycache__/
+.venv/
