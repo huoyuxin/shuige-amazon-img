@@ -18,6 +18,7 @@ class Config:
     cache_file: Path
     log_file: Path
     request_timeout_seconds: int
+    max_workers: int
     user_agent: str
 
 
@@ -40,5 +41,6 @@ def load_config(path: Path) -> Config:
         cache_file=Path(raw.get("cache_file", "data/image_cache.json")),
         log_file=Path(raw.get("log_file", "logs/amazon_img.log")),
         request_timeout_seconds=int(raw.get("request_timeout_seconds", 30)),
+        max_workers=max(1, int(raw.get("max_workers", 50))),
         user_agent=raw.get("user_agent", "AmazonImageUploader/1.0"),
     )

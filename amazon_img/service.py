@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -33,6 +34,24 @@ def _log_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
+def _upload_one(url: str, cached_item: dict | None, store: R2Store, config: Config) -> dict:
+    if cached_item:
+        return dict(cached_item)
+    content, content_type = _download(url, config)
+    key, public_url = store.upload(url, content, content_type)
+    return {"r2_url": public_url, "object_key": key, "status": "uploaded",
+            "uploaded_at": datetime.now(timezone.utc).isoformat()}
+
+
+def _log_progress(logger: logging.Logger, operation: str, task_id: str,
+                  completed: int, total: int, status: str) -> None:
+    remaining = max(0, total - completed)
+    remaining_pct = remaining * 100 / total if total else 0.0
+    completed_pct = completed * 100 / total if total else 100.0
+    logger.info("%s进度 task_id=%s completed=%d/%d completed_pct=%.1f%% remaining=%d remaining_pct=%.1f%% status=%s",
+                operation, task_id, completed, total, completed_pct, remaining, remaining_pct, status)
+
+
 def upload_and_replace(source: Path, config: Config, logger: logging.Logger) -> tuple[str, Path]:
     source = source.resolve()
     if source.suffix.lower() not in {".xlsx", ".xlsm"}:
@@ -51,46 +70,64 @@ def upload_and_replace(source: Path, config: Config, logger: logging.Logger) -> 
                 task_id, source, copy_path, len(urls))
     store = R2Store(config)
     editor = WorkbookEditor(copy_path)
-    successful = 0
+    reusable: dict[str, dict] = {}
+    for previous_task in cache["tasks"].values():
+        for previous_url, previous_item in previous_task.get("items", {}).items():
+            if previous_item.get("status") == "uploaded":
+                reusable.setdefault(previous_url, previous_item)
+
+    total = len(urls)
+    completed = successful = 0
+    _log_progress(logger, "上传替换", task_id, 0, total, "started")
+    executor = ThreadPoolExecutor(max_workers=config.max_workers, thread_name_prefix="image-upload")
+    futures = {
+        executor.submit(_upload_one, url, reusable.get(url), store, config): (url, cells)
+        for url, cells in urls.items()
+    }
     try:
-        for url, cells in urls.items():
-            item = cache["tasks"][task_id]["items"].get(url)
-            if item and item.get("status") != "uploaded":
-                item = None
-            if not item:
-                # Reuse a prior successful upload for the same source URL.
-                for old_task in cache["tasks"].values():
-                    old = old_task.get("items", {}).get(url)
-                    if old and old.get("status") == "uploaded":
-                        item = dict(old)
-                        break
+        for future in as_completed(futures):
+            url, cells = futures[future]
+            status = "failed"
             try:
-                if not item:
-                    content, content_type = _download(url, config)
-                    key, public_url = store.upload(url, content, content_type)
-                    item = {"r2_url": public_url, "object_key": key, "status": "uploaded",
-                            "uploaded_at": datetime.now(timezone.utc).isoformat()}
+                item = future.result()
                 cache["tasks"][task_id]["items"][url] = item
                 save_cache(config.cache_file, cache)
-                for sheet, coordinate in cells:
-                    editor.replace(sheet, coordinate, url, item["r2_url"])
-                successful += 1
-                if successful % 25 == 0:
-                    editor.save()
-                logger.info("上传替换成功 task_id=%s url=%s cells=%d r2_url=%s",
-                            task_id, _log_url(url), len(cells), item["r2_url"])
-            except KeyboardInterrupt:
-                logger.warning("收到中断信号，正在保存工作簿与缓存 task_id=%s", task_id)
+                try:
+                    for sheet, coordinate in cells:
+                        editor.replace(sheet, coordinate, url, item["r2_url"])
+                    successful += 1
+                    status = "success"
+                except Exception as error:
+                    item["replacement_error"] = str(error)
+                    cache["tasks"][task_id]["items"][url] = item
+                    save_cache(config.cache_file, cache)
+                    logger.error("工作簿替换失败 task_id=%s url=%s", task_id, _log_url(url),
+                                 exc_info=(type(error), error, error.__traceback__))
+                    status = "replacement_failed"
+            except Exception as error:
+                cache["tasks"][task_id]["items"][url] = {
+                    "status": "failed", "cells": cells, "error": str(error)
+                }
+                save_cache(config.cache_file, cache)
+                logger.error("处理失败 task_id=%s url=%s", task_id, _log_url(url),
+                             exc_info=(type(error), error, error.__traceback__))
+            completed += 1
+            if completed % 25 == 0:
                 editor.save()
-                cache["tasks"][task_id]["status"] = "interrupted"
-                cache["tasks"][task_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
-                save_cache(config.cache_file, cache)
-                raise
-            except Exception:
-                cache["tasks"][task_id]["items"][url] = {"status": "failed", "cells": cells}
-                save_cache(config.cache_file, cache)
-                logger.exception("处理失败 task_id=%s url=%s", task_id, _log_url(url))
+            _log_progress(logger, "上传替换", task_id, completed, total, status)
         editor.save()
+    except KeyboardInterrupt:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        logger.warning("收到中断信号，正在保存工作簿与缓存 task_id=%s", task_id)
+        editor.save()
+        cache["tasks"][task_id]["status"] = "interrupted"
+        cache["tasks"][task_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_cache(config.cache_file, cache)
+        raise
+    else:
+        executor.shutdown(wait=True)
     finally:
         editor.close()
     task = cache["tasks"][task_id]
@@ -118,7 +155,8 @@ def cleanup_task(task_id: str, source: Path, config: Config, logger: logging.Log
     urls = find_image_urls(source, pattern)
     logger.info("清理开始 task_id=%s workbook=%s matched_urls=%d", task_id, source, len(urls))
     store = R2Store(config)
-    deleted = failed = 0
+    by_key: dict[str, list[str]] = {}
+    invalid_items: list[tuple[str, Exception]] = []
     for original_url, item in list(task.get("items", {}).items()):
         if item.get("status") != "uploaded":
             continue
@@ -128,21 +166,52 @@ def cleanup_task(task_id: str, source: Path, config: Config, logger: logging.Log
             continue
         try:
             key = item.get("object_key") or store.key_from_url(item["r2_url"])
-            store.delete(key)
-            del task["items"][original_url]
-            save_cache(config.cache_file, cache)
-            deleted += 1
-            logger.info("清理成功 task_id=%s object_key=%s source_url=%s",
-                        task_id, key, _log_url(original_url))
-        except KeyboardInterrupt:
-            logger.warning("收到中断信号，保留未完成映射 task_id=%s", task_id)
-            task["status"] = "cleanup_interrupted"
-            task["updated_at"] = datetime.now(timezone.utc).isoformat()
-            save_cache(config.cache_file, cache)
-            raise
-        except Exception:
-            failed += 1
-            logger.exception("清理失败 task_id=%s source_url=%s", task_id, _log_url(original_url))
+            by_key.setdefault(key, []).append(original_url)
+        except Exception as error:
+            invalid_items.append((original_url, error))
+
+    total = len(by_key) + len(invalid_items)
+    deleted = failed = completed = 0
+    _log_progress(logger, "清理", task_id, 0, total, "started")
+    for original_url, error in invalid_items:
+        failed += 1
+        completed += 1
+        logger.error("清理目标无效 task_id=%s source_url=%s error=%s",
+                     task_id, _log_url(original_url), error)
+        _log_progress(logger, "清理", task_id, completed, total, "failed")
+
+    executor = ThreadPoolExecutor(max_workers=config.max_workers, thread_name_prefix="r2-delete")
+    futures = {executor.submit(store.delete, key): key for key in by_key}
+    try:
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                future.result()
+                for original_url in by_key[key]:
+                    task["items"].pop(original_url, None)
+                save_cache(config.cache_file, cache)
+                deleted += 1
+                status = "success"
+                logger.info("清理成功 task_id=%s object_key=%s mappings=%d",
+                            task_id, key, len(by_key[key]))
+            except Exception as error:
+                failed += 1
+                status = "failed"
+                logger.error("清理失败 task_id=%s object_key=%s", task_id, key,
+                             exc_info=(type(error), error, error.__traceback__))
+            completed += 1
+            _log_progress(logger, "清理", task_id, completed, total, status)
+    except KeyboardInterrupt:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        logger.warning("收到中断信号，保留未完成映射 task_id=%s", task_id)
+        task["status"] = "cleanup_interrupted"
+        task["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_cache(config.cache_file, cache)
+        raise
+    else:
+        executor.shutdown(wait=True)
     task["status"] = "cleaned" if not task["items"] else "cleanup_partial"
     task["cleaned_at"] = datetime.now(timezone.utc).isoformat()
     save_cache(config.cache_file, cache)

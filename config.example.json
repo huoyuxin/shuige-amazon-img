@@ -11,5 +11,6 @@
   "cache_file": "data/image_cache.json",
   "log_file": "logs/amazon_img.log",
   "request_timeout_seconds": 30,
+  "max_workers": 100,
   "user_agent": "AmazonImageUploader/1.0"
 }

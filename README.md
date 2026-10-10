@@ -27,22 +27,22 @@ cp config.example.json config.json
 ## 上传并替换
 
 ```bash
-python -m amazon_img.cli --config config.json upload "/Users/yuxinhuo/Desktop/Super Browser/shuige__/20260927-shop1-carcup/correct.xlsx"
+python -m amazon_img.cli --config config.json upload "/Users/yuxinhuo/Desktop/Super Browser/shuige__/20261010-shop1-carcup-2/correct_parent_completed.xlsx"
 ```
 
 工具会在原文件夹生成 `商品表.amazon-img-任务ID.xlsx`（`.xlsm` 输入会生成 `.xlsm` 副本）。原表不会修改。命令打印任务 ID 和副本路径；日志也记录任务 ID 与原表/副本路径。只把生成的副本用于 Amazon 批量上传。
 
-每个唯一 URL 只下载、上传一次，并替换副本中所有匹配单元格。每条完成后立即更新本地缓存，工作簿每 25 个唯一链接检查点保存一次，结束时保存最终副本；Ctrl+C 会立即保存当前工作簿和缓存。可中断后重新运行上传命令；缓存会复用已成功上传的 URL。
+每个唯一 URL 只处理一次；图片下载和 R2 上传按 `max_workers` 并发执行（默认 50），缓存命中也会计入进度。Excel 修改和缓存保存按完成结果顺序提交，避免并发写文件。每条完成后立即更新缓存，工作簿每 25 个唯一链接检查点保存一次，结束时保存最终副本；Ctrl+C 会立即保存当前工作簿和缓存。日志逐项记录完成数、完成百分比、剩余数和剩余百分比。可在 `config.json` 中调整 `max_workers`。
 
 ## 清理
 
 先从 Amazon 上传结果确认图片已经抓取，再运行：
 
 ```bash
-python -m amazon_img.cli --config config.json cleanup "/路径/商品表.amazon-img-任务ID.xlsx" 任务ID
+python -m amazon_img.cli --config config.json cleanup "/Users/yuxinhuo/Desktop/Super Browser/shuige__/20261010-shop1-carcup-2/correct_parent_completed.xlsx" 20261010-161632-a4f01753
 ```
 
-清理按任务 ID 读取对象清单；可传入该任务的原表或生成的副本，且只删除所选表格中仍存在对应原图 URL 或 R2 URL 的对象。每个对象删除成功后才从缓存移除。删除失败的映射会保留，可重试清理命令。不要在 Amazon 尚未抓取图片时清理。
+清理按任务 ID 读取对象清单；可传入该任务的原表或生成的副本，且只删除所选表格中仍存在对应原图 URL 或 R2 URL 的对象。不同 R2 对象按 `max_workers` 并发删除；每个对象删除成功后，主线程立即从缓存移除对应映射。日志逐项记录完成数和剩余百分比。删除失败的映射会保留，可重试清理命令。不要在 Amazon 尚未抓取图片时清理。
 
 ## 文件与恢复
 
